@@ -87,6 +87,18 @@
     <div id="summary-output"></div>
   </div>
 
+  <div id="chat-section">
+    <div class="section-label">// ask about this video</div>
+    <div class="card chat-card">
+      <p class="chat-hint">Uses the raw transcript and summary. Each request sends full context plus your four most recent turns. <kbd>Enter</kbd> sends · <kbd>Shift</kbd>+<kbd>Enter</kbd> newline.</p>
+      <div id="chat-log" class="chat-log" aria-live="polite"></div>
+      <div class="chat-input-row">
+        <textarea id="chat-input" rows="2" placeholder="Ask a question about the transcript or summary…" disabled></textarea>
+        <button type="button" id="chat-send-btn" class="chat-send-btn" disabled>Send</button>
+      </div>
+    </div>
+  </div>
+
   <footer>
     <span>yt-summarizer v1.0</span>
     <span>powered by yt-dlp + lm studio</span>

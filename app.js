@@ -1,6 +1,10 @@
 const $ = id => document.getElementById(id);
 
 let lastSummaryMarkdown = '';
+let lastTranscript = '';
+/** @type {{ role: 'user' | 'assistant', content: string }[]} */
+let chatMessages = [];
+let chatSending = false;
 
 function escapeHtml(s) {
   return String(s)
@@ -193,6 +197,8 @@ async function runSummarize() {
 
   clearError();
   lastSummaryMarkdown = '';
+  lastTranscript = '';
+  resetChat();
   $('result-section').style.display = 'none';
   $('summary-output').innerHTML = '';
   $('log-section').style.display = 'block';
@@ -272,6 +278,12 @@ async function runSummarize() {
         if (typeof tlen === 'number') {
           log(`Transcript length: ${tlen.toLocaleString()} chars`);
         }
+        if (typeof evt.data.transcript === 'string') {
+          lastTranscript = evt.data.transcript;
+        } else {
+          lastTranscript = '';
+        }
+        showChatSection();
         log('Streaming summary from model...', 'info');
         $('result-section').style.display = 'block';
         $('result-section').scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -330,5 +342,207 @@ function copySummary() {
   });
 }
 
+function resetChat() {
+  chatMessages = [];
+  chatSending = false;
+  const log = $('chat-log');
+  if (log) log.innerHTML = '';
+  const input = $('chat-input');
+  const sendBtn = $('chat-send-btn');
+  const section = $('chat-section');
+  if (input) {
+    input.value = '';
+    input.disabled = true;
+  }
+  if (sendBtn) sendBtn.disabled = true;
+  if (section) section.style.display = 'none';
+}
+
+function setChatBusy(sending) {
+  chatSending = sending;
+  const input = $('chat-input');
+  const sendBtn = $('chat-send-btn');
+  const canType = !sending && lastTranscript.trim().length > 0;
+  if (input) input.disabled = !canType;
+  if (sendBtn) sendBtn.disabled = !canType;
+}
+
+function renderChatLog() {
+  const log = $('chat-log');
+  if (!log) return;
+  log.innerHTML = '';
+  for (const m of chatMessages) {
+    const wrap = document.createElement('div');
+    wrap.className = 'chat-msg ' + m.role;
+    const roleEl = document.createElement('div');
+    roleEl.className = 'chat-role';
+    roleEl.textContent = m.role === 'user' ? 'You' : 'Assistant';
+    const body = document.createElement('div');
+    body.className =
+      m.role === 'assistant' ? 'chat-body chat-md' : 'chat-body';
+    if (m.role === 'assistant') {
+      body.innerHTML = markdownToHtml(m.content);
+    } else {
+      body.textContent = m.content;
+    }
+    wrap.appendChild(roleEl);
+    wrap.appendChild(body);
+    log.appendChild(wrap);
+  }
+  log.scrollTop = log.scrollHeight;
+}
+
+function showChatSection() {
+  const section = $('chat-section');
+  if (section) section.style.display = 'block';
+  setChatBusy(chatSending);
+}
+
+function rollbackPendingChatTurn() {
+  if (chatMessages.length && chatMessages[chatMessages.length - 1].role === 'assistant') {
+    chatMessages.pop();
+  }
+  if (chatMessages.length && chatMessages[chatMessages.length - 1].role === 'user') {
+    chatMessages.pop();
+  }
+  renderChatLog();
+}
+
+function updateLastAssistantMarkdown(md) {
+  const log = $('chat-log');
+  if (!log) return;
+  const nodes = log.querySelectorAll('.chat-msg.assistant');
+  const last = nodes[nodes.length - 1];
+  if (!last) {
+    renderChatLog();
+    return;
+  }
+  const body = last.querySelector('.chat-body.chat-md') || last.querySelector('.chat-body');
+  if (!body) return;
+  body.innerHTML = markdownToHtml(md);
+  log.scrollTop = log.scrollHeight;
+}
+
+async function sendChat() {
+  if (chatSending) return;
+  const input = $('chat-input');
+  const text = (input && input.value || '').trim();
+  if (!text) return;
+  if (!lastTranscript.trim() && !lastSummaryMarkdown.trim()) {
+    showError('Run a video first so transcript and summary are available.');
+    return;
+  }
+  const model = $('model-select').value;
+  if (!model) {
+    showError('Select a model before sending a chat message.');
+    return;
+  }
+
+  chatMessages.push({ role: 'user', content: text });
+  if (input) input.value = '';
+  chatMessages.push({ role: 'assistant', content: '' });
+  renderChatLog();
+  setChatBusy(true);
+  clearError();
+
+  const baseUrl = $('base-url').value.trim();
+  const apiKey = $('api-key').value.trim();
+
+  let replyMd = '';
+  let rafPending = null;
+  const flushAssistant = () => {
+    rafPending = null;
+    const last = chatMessages[chatMessages.length - 1];
+    if (last && last.role === 'assistant') last.content = replyMd;
+    updateLastAssistantMarkdown(replyMd);
+  };
+  const scheduleAssistantFlush = () => {
+    if (rafPending === null) rafPending = requestAnimationFrame(flushAssistant);
+  };
+
+  try {
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        transcript: lastTranscript,
+        summary: lastSummaryMarkdown,
+        messages: chatMessages.slice(0, -1).slice(-4),
+        base_url: baseUrl,
+        model,
+        api_key: apiKey || null,
+      }),
+    });
+
+    const ct = (res.headers.get('content-type') || '').toLowerCase();
+
+    if (!res.ok || !ct.includes('text/event-stream')) {
+      let msg = !res.ok ? `HTTP ${res.status}` : 'Expected streamed chat (text/event-stream)';
+      if (ct.includes('application/json')) {
+        try {
+          const errBody = await res.json();
+          if (errBody.error) msg = errBody.error;
+        } catch { /* ignore */ }
+      }
+      rollbackPendingChatTurn();
+      showError(msg);
+      setChatBusy(false);
+      return;
+    }
+
+    let streamError = null;
+    await readSseStream(res, evt => {
+      if (evt.event === 'token' && evt.data && typeof evt.data.t === 'string') {
+        replyMd += evt.data.t;
+        scheduleAssistantFlush();
+        return;
+      }
+      if (evt.event === 'done') return;
+      if (evt.event === 'error' && evt.data && evt.data.error) {
+        streamError = evt.data.error;
+      }
+    });
+
+    if (rafPending !== null) {
+      cancelAnimationFrame(rafPending);
+      rafPending = null;
+    }
+    const last = chatMessages[chatMessages.length - 1];
+    if (last && last.role === 'assistant') last.content = replyMd;
+    updateLastAssistantMarkdown(replyMd);
+
+    if (streamError) {
+      rollbackPendingChatTurn();
+      showError(streamError);
+      setChatBusy(false);
+      return;
+    }
+
+    if (!replyMd.trim()) {
+      rollbackPendingChatTurn();
+      showError('The stream ended without assistant text. Try another model or check LM Studio.');
+      setChatBusy(false);
+      return;
+    }
+
+    renderChatLog();
+  } catch (err) {
+    rollbackPendingChatTurn();
+    showError(err.message || String(err));
+  }
+  setChatBusy(false);
+}
+
 $('yt-url').addEventListener('keydown', e => { if (e.key === 'Enter') runSummarize(); });
+const chatInputEl = $('chat-input');
+const chatSendEl = $('chat-send-btn');
+if (chatSendEl) chatSendEl.addEventListener('click', sendChat);
+if (chatInputEl) {
+  chatInputEl.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendChat();
+    }
+  });
+}
 window.addEventListener('load', loadModels);

@@ -111,9 +111,12 @@ def _raw_content_to_text(raw) -> str:
     return str(raw)
 
 
+MAX_TRANSCRIPT_CHARS = 90_000
+
+
 def _summarize_messages(transcript: str) -> list:
-    if len(transcript) > 90_000:
-        transcript = transcript[:90_000] + "\n\n[transcript truncated]"
+    if len(transcript) > MAX_TRANSCRIPT_CHARS:
+        transcript = transcript[:MAX_TRANSCRIPT_CHARS] + "\n\n[transcript truncated]"
     return [
         {
             "role": "system",
@@ -137,6 +140,56 @@ def iter_summarize_stream(transcript: str, base_url: str, model: str, api_key: s
         model=model,
         messages=_summarize_messages(transcript),
         temperature=0.3,
+        stream=True,
+    )
+    for chunk in stream:
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+        if delta is None:
+            continue
+        raw = getattr(delta, "content", None)
+        if raw is None:
+            raw = getattr(delta, "refusal", None)
+        piece = _raw_content_to_text(raw)
+        if piece:
+            yield piece
+
+
+def _chat_system_content(transcript: str, summary: str) -> str:
+    t = transcript or ""
+    if len(t) > MAX_TRANSCRIPT_CHARS:
+        t = t[:MAX_TRANSCRIPT_CHARS] + "\n\n[transcript truncated]"
+    s = summary or ""
+    return (
+        "You are a helpful assistant. Answer questions using the raw video transcript "
+        "and the summary below. Prefer the transcript for exact quotes and details; "
+        "use the summary for structure. If something is not supported by them, say so.\n\n"
+        f"--- RAW TRANSCRIPT ---\n{t}\n\n"
+        f"--- SUMMARY ---\n{s}"
+    )
+
+
+def _normalize_chat_tail(messages: list, limit: int = 4) -> list:
+    cleaned = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        content = m.get("content")
+        if role not in ("user", "assistant") or not isinstance(content, str):
+            continue
+        cleaned.append({"role": role, "content": content})
+    return cleaned[-limit:] if limit else cleaned
+
+
+def iter_chat_stream(messages: list, base_url: str, model: str, api_key: str = ""):
+    """Stream chat completion text chunks from LM Studio (OpenAI-compatible)."""
+    client = OpenAI(base_url=base_url, api_key=api_key or "lm-studio")
+    stream = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=0.4,
         stream=True,
     )
     for chunk in stream:
@@ -211,6 +264,7 @@ def summarize():
         meta = {
             "transcript_length": len(transcript),
             "saved_transcript": rel_saved.replace(os.sep, "/"),
+            "transcript": transcript,
         }
 
         def event_stream():
@@ -248,6 +302,65 @@ def summarize():
         return jsonify({"error": str(e)}), 500
     except Exception as e:
         return jsonify({"error": f"Unexpected error: {e}"}), 500
+
+
+@app.route("/api/chat", methods=["POST"])
+def chat():
+    data = request.get_json() or {}
+    transcript = data.get("transcript")
+    transcript = transcript.strip() if isinstance(transcript, str) else ""
+    summary = data.get("summary")
+    summary = summary.strip() if isinstance(summary, str) else ""
+    raw_messages = data.get("messages")
+    if not isinstance(raw_messages, list):
+        raw_messages = []
+    base_url = (data.get("base_url") or LMSTUDIO_BASE_URL).rstrip("/")
+    model = (data.get("model") or "").strip()
+    api_key = (data.get("api_key") or "").strip()
+
+    if not transcript and not summary:
+        return jsonify({"error": "Provide transcript and/or summary as context."}), 400
+    if not model:
+        return jsonify({"error": "No model selected."}), 400
+
+    tail = _normalize_chat_tail(raw_messages, 4)
+    if not tail:
+        return jsonify({"error": "No chat messages to process."}), 400
+    if tail[-1]["role"] != "user":
+        return jsonify({"error": "The latest message must be from the user."}), 400
+
+    api_messages = [
+        {"role": "system", "content": _chat_system_content(transcript, summary)},
+        *tail,
+    ]
+
+    def event_stream():
+        total = []
+        try:
+            for piece in iter_chat_stream(api_messages, base_url, model, api_key):
+                total.append(piece)
+                yield f"event: token\ndata: {json.dumps({'t': piece})}\n\n"
+            full = "".join(total).strip()
+            if not full:
+                err = (
+                    "Model returned an empty reply (no streamed text). "
+                    "Try another model or check LM Studio server logs."
+                )
+                yield f"event: error\ndata: {json.dumps({'error': err})}\n\n"
+                return
+            yield "event: done\ndata: {}\n\n"
+        except Exception as e:
+            yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+
+    return Response(
+        stream_with_context(event_stream()),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 if __name__ == "__main__":
