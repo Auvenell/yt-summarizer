@@ -159,6 +159,11 @@ def index():
     return send_from_directory(".", "index.html")
 
 
+@app.route("/styles.css")
+def styles():
+    return send_from_directory(_APP_DIR, "styles.css", mimetype="text/css")
+
+
 @app.route("/api/models", methods=["GET"])
 def get_models():
     """Proxy LM Studio's model list so the frontend can populate a dropdown."""
