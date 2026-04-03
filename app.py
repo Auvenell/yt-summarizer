@@ -18,6 +18,26 @@ LMSTUDIO_BASE_URL = os.environ.get("LMSTUDIO_BASE_URL", "http://localhost:1234/v
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOADED_SUBTITLES_DIR = os.path.join(_APP_DIR, "downloaded-subtitles")
 
+def _safe_downloaded_subtitle_path(rel_path: str) -> str:
+    """
+    Convert a client-provided relative path like 'downloaded-subtitles/x.en.txt'
+    into an absolute path under DOWNLOADED_SUBTITLES_DIR. Raises ValueError if invalid.
+    """
+    if not isinstance(rel_path, str) or not rel_path.strip():
+        raise ValueError("Missing subtitle path.")
+    p = rel_path.replace("\\", "/").lstrip("/")
+    prefix = "downloaded-subtitles/"
+    if not p.startswith(prefix):
+        raise ValueError("Invalid subtitle path.")
+    leaf = p[len(prefix):]
+    if not leaf or "/" in leaf:
+        raise ValueError("Invalid subtitle filename.")
+    abs_path = os.path.abspath(os.path.join(DOWNLOADED_SUBTITLES_DIR, leaf))
+    base = os.path.abspath(DOWNLOADED_SUBTITLES_DIR)
+    if os.path.commonpath([abs_path, base]) != base:
+        raise ValueError("Invalid subtitle path.")
+    return abs_path
+
 
 def _safe_filename_stem(name: str) -> str:
     s = re.sub(r"[^\w\s-]", "", name, flags=re.UNICODE)
@@ -360,6 +380,21 @@ def chat():
             "X-Accel-Buffering": "no",
         },
     )
+
+@app.route("/api/subtitle", methods=["GET"])
+def get_subtitle():
+    rel = (request.args.get("path") or "").strip()
+    try:
+        abs_path = _safe_downloaded_subtitle_path(rel)
+        if not os.path.exists(abs_path):
+            return jsonify({"error": "Subtitle file not found."}), 404
+        with open(abs_path, "r", encoding="utf-8") as f:
+            txt = f.read()
+        return Response(txt, mimetype="text/plain; charset=utf-8")
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": f"Unexpected error: {e}"}), 500
 
 
 if __name__ == "__main__":

@@ -200,6 +200,57 @@ button#run-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
 #log-section { display: none; }
 
+.subtitle-details {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0;
+  margin-bottom: 20px;
+  overflow: hidden;
+}
+
+.subtitle-summary {
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+  padding: 14px 16px;
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  border-bottom: 1px solid var(--border);
+}
+
+.subtitle-details:not([open]) .subtitle-summary {
+  border-bottom: none;
+}
+
+.subtitle-summary::-webkit-details-marker { display: none; }
+
+.subtitle-summary::after {
+  content: "▸";
+  float: right;
+  color: var(--muted);
+  transform: translateY(1px);
+}
+
+.subtitle-details[open] .subtitle-summary::after {
+  content: "▾";
+}
+
+.subtitle-output {
+  margin: 0;
+  padding: 16px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+#subtitle-section { display: none; }
+
 .log-box {
   background: var(--bg);
   border: 1px solid var(--border);

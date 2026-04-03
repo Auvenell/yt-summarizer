@@ -2,6 +2,7 @@ const $ = id => document.getElementById(id);
 
 let lastSummaryMarkdown = '';
 let lastTranscript = '';
+let lastRawSubtitle = '';
 /** @type {{ role: 'user' | 'assistant', content: string }[]} */
 let chatMessages = [];
 let chatSending = false;
@@ -98,6 +99,48 @@ function markdownToHtml(md) {
 function setSummaryFromMarkdown(markdown) {
   lastSummaryMarkdown = markdown;
   $('summary-output').innerHTML = markdownToHtml(markdown);
+}
+
+function resetSubtitlePanel() {
+  lastRawSubtitle = '';
+  const sec = $('subtitle-section');
+  const det = $('subtitle-details');
+  const out = $('subtitle-output');
+  if (out) out.textContent = '';
+  if (det) det.open = false;
+  if (sec) sec.style.display = 'none';
+}
+
+async function loadRawSubtitleFromPath(relPath) {
+  if (!relPath || typeof relPath !== 'string') return;
+  const sec = $('subtitle-section');
+  const det = $('subtitle-details');
+  const out = $('subtitle-output');
+  const sum = document.querySelector('#subtitle-details > summary');
+  if (sec) sec.style.display = 'block';
+  if (sum) sum.textContent = 'show';
+  if (out) out.textContent = 'Loading…';
+  try {
+    const res = await fetch(`/api/subtitle?${new URLSearchParams({ path: relPath })}`);
+    const ct = (res.headers.get('content-type') || '').toLowerCase();
+    if (!res.ok) {
+      let msg = `HTTP ${res.status}`;
+      if (ct.includes('application/json')) {
+        try {
+          const j = await res.json();
+          if (j && j.error) msg = j.error;
+        } catch { /* ignore */ }
+      }
+      if (out) out.textContent = `Could not load subtitle: ${msg}`;
+      return;
+    }
+    const txt = await res.text();
+    lastRawSubtitle = txt;
+    if (out) out.textContent = txt;
+    if (det) det.open = false; // keep initially collapsed
+  } catch (e) {
+    if (out) out.textContent = `Could not load subtitle: ${e.message || String(e)}`;
+  }
 }
 
 /** Parse one SSE block (lines ending with blank line already stripped). */
@@ -198,6 +241,7 @@ async function runSummarize() {
   clearError();
   lastSummaryMarkdown = '';
   lastTranscript = '';
+  resetSubtitlePanel();
   resetChat();
   $('result-section').style.display = 'none';
   $('summary-output').innerHTML = '';
@@ -282,6 +326,9 @@ async function runSummarize() {
           lastTranscript = evt.data.transcript;
         } else {
           lastTranscript = '';
+        }
+        if (evt.data && typeof evt.data.saved_transcript === 'string') {
+          loadRawSubtitleFromPath(evt.data.saved_transcript);
         }
         showChatSection();
         log('Streaming summary from model...', 'info');
@@ -545,3 +592,13 @@ if (chatInputEl) {
   });
 }
 window.addEventListener('load', loadModels);
+
+// Keep the subtitle summary label in sync with open/closed state
+const subtitleDetailsEl = document.getElementById('subtitle-details');
+if (subtitleDetailsEl) {
+  subtitleDetailsEl.addEventListener('toggle', () => {
+    const sum = subtitleDetailsEl.querySelector('summary');
+    if (!sum) return;
+    sum.textContent = subtitleDetailsEl.open ? 'hide' : 'show';
+  });
+}
