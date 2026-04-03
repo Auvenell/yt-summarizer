@@ -113,23 +113,36 @@ def _raw_content_to_text(raw) -> str:
 
 MAX_TRANSCRIPT_CHARS = 90_000
 
+# Same system string for /api/summarize and /api/chat so LM Studio can prefix-cache
+# the shared system + transcript user block across both requests.
+SHARED_SYSTEM = (
+    "You are a helpful assistant that summarizes video transcripts clearly and concisely."
+)
+
+SUMMARIZE_INSTRUCTION_USER = (
+    "Please provide a clear, structured summary of the video transcript in your previous "
+    "message. Include: a brief overview, the main topics covered, and key takeaways."
+)
+
+CHAT_MODE_USER = (
+    "Answer my questions using only the transcript from the first user message in this "
+    "conversation. Quote or paraphrase accurately; if something is not in the transcript, say so."
+)
+
+
+def _transcript_user_block(transcript: str) -> str:
+    """Identical transcript payload for summarize and chat (must stay byte-stable for caching)."""
+    t = transcript or ""
+    if len(t) > MAX_TRANSCRIPT_CHARS:
+        t = t[:MAX_TRANSCRIPT_CHARS] + "\n\n[transcript truncated]"
+    return f"TRANSCRIPT:\n{t}"
+
 
 def _summarize_messages(transcript: str) -> list:
-    if len(transcript) > MAX_TRANSCRIPT_CHARS:
-        transcript = transcript[:MAX_TRANSCRIPT_CHARS] + "\n\n[transcript truncated]"
     return [
-        {
-            "role": "system",
-            "content": "You are a helpful assistant that summarizes video transcripts clearly and concisely.",
-        },
-        {
-            "role": "user",
-            "content": (
-                "Please provide a clear, structured summary of the following video transcript. "
-                "Include: a brief overview, the main topics covered, and key takeaways.\n\n"
-                f"TRANSCRIPT:\n{transcript}"
-            ),
-        },
+        {"role": "system", "content": SHARED_SYSTEM},
+        {"role": "user", "content": _transcript_user_block(transcript)},
+        {"role": "user", "content": SUMMARIZE_INSTRUCTION_USER},
     ]
 
 
@@ -154,20 +167,6 @@ def iter_summarize_stream(transcript: str, base_url: str, model: str, api_key: s
         piece = _raw_content_to_text(raw)
         if piece:
             yield piece
-
-
-def _chat_system_content(transcript: str, summary: str) -> str:
-    t = transcript or ""
-    if len(t) > MAX_TRANSCRIPT_CHARS:
-        t = t[:MAX_TRANSCRIPT_CHARS] + "\n\n[transcript truncated]"
-    s = summary or ""
-    return (
-        "You are a helpful assistant. Answer questions using the raw video transcript "
-        "and the summary below. Prefer the transcript for exact quotes and details; "
-        "use the summary for structure. If something is not supported by them, say so.\n\n"
-        f"--- RAW TRANSCRIPT ---\n{t}\n\n"
-        f"--- SUMMARY ---\n{s}"
-    )
 
 
 def _normalize_chat_tail(messages: list, limit: int = 4) -> list:
@@ -309,8 +308,6 @@ def chat():
     data = request.get_json() or {}
     transcript = data.get("transcript")
     transcript = transcript.strip() if isinstance(transcript, str) else ""
-    summary = data.get("summary")
-    summary = summary.strip() if isinstance(summary, str) else ""
     raw_messages = data.get("messages")
     if not isinstance(raw_messages, list):
         raw_messages = []
@@ -318,8 +315,8 @@ def chat():
     model = (data.get("model") or "").strip()
     api_key = (data.get("api_key") or "").strip()
 
-    if not transcript and not summary:
-        return jsonify({"error": "Provide transcript and/or summary as context."}), 400
+    if not transcript:
+        return jsonify({"error": "Transcript is required for chat."}), 400
     if not model:
         return jsonify({"error": "No model selected."}), 400
 
@@ -330,7 +327,9 @@ def chat():
         return jsonify({"error": "The latest message must be from the user."}), 400
 
     api_messages = [
-        {"role": "system", "content": _chat_system_content(transcript, summary)},
+        {"role": "system", "content": SHARED_SYSTEM},
+        {"role": "user", "content": _transcript_user_block(transcript)},
+        {"role": "user", "content": CHAT_MODE_USER},
         *tail,
     ]
 

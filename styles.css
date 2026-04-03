@@ -441,6 +441,7 @@ footer span { letter-spacing: 0.05em; }
 .chat-msg.user {
   background: var(--accent-dim);
   border: 1px solid var(--border);
+  text-align: right;
 }
 
 .chat-msg.assistant {

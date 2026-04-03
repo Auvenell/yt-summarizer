@@ -428,8 +428,8 @@ async function sendChat() {
   const input = $('chat-input');
   const text = (input && input.value || '').trim();
   if (!text) return;
-  if (!lastTranscript.trim() && !lastSummaryMarkdown.trim()) {
-    showError('Run a video first so transcript and summary are available.');
+  if (!lastTranscript.trim()) {
+    showError('A transcript is required for chat (run a video with subtitles).');
     return;
   }
   const model = $('model-select').value;
@@ -466,7 +466,6 @@ async function sendChat() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         transcript: lastTranscript,
-        summary: lastSummaryMarkdown,
         messages: chatMessages.slice(0, -1).slice(-4),
         base_url: baseUrl,
         model,
