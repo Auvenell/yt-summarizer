@@ -1,10 +1,11 @@
+import json
 import os
 import re
 import sys
 import glob
 import subprocess
 import tempfile
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, Response, stream_with_context
 from flask_cors import CORS
 from openai import OpenAI
 
@@ -93,41 +94,8 @@ def vtt_to_text(vtt_path: str) -> str:
     return " ".join(lines)
 
 
-def summarize_with_lmstudio(transcript: str, base_url: str, model: str, api_key: str = "") -> str:
-    """Send transcript to LM Studio and return the summary."""
-    # Use provided key as Bearer token; fall back to dummy value if not set
-    client = OpenAI(base_url=base_url, api_key=api_key or "lm-studio")
-
-    if len(transcript) > 90_000:
-        transcript = transcript[:90_000] + "\n\n[transcript truncated]"
-
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {
-                "role": "system",
-                "content": "You are a helpful assistant that summarizes video transcripts clearly and concisely.",
-            },
-            {
-                "role": "user",
-                "content": (
-                    "Please provide a clear, structured summary of the following video transcript. "
-                    "Include: a brief overview, the main topics covered, and key takeaways.\n\n"
-                    f"TRANSCRIPT:\n{transcript}"
-                ),
-            },
-        ],
-        temperature=0.3,
-    )
-
-    if not response.choices:
-        raise RuntimeError("Model returned no choices (empty completion).")
-
-    msg = response.choices[0].message
-    raw = getattr(msg, "content", None) if msg else None
-    if raw is None and msg is not None:
-        raw = getattr(msg, "refusal", None)
-
+def _raw_content_to_text(raw) -> str:
+    """Normalize message.content or delta.content (str, list of parts, or None) to plain text."""
     if isinstance(raw, list):
         parts = []
         for p in raw:
@@ -137,19 +105,52 @@ def summarize_with_lmstudio(transcript: str, base_url: str, model: str, api_key:
                 parts.append(getattr(p, "text", "") or "")
             elif isinstance(p, str):
                 parts.append(p)
-        text = "".join(parts)
-    elif raw is None:
-        text = ""
-    else:
-        text = str(raw)
+        return "".join(parts)
+    if raw is None:
+        return ""
+    return str(raw)
 
-    text = text.strip()
-    if not text:
-        raise RuntimeError(
-            "Model returned an empty summary (no text in message.content). "
-            "Try another model or check LM Studio server logs."
-        )
-    return text
+
+def _summarize_messages(transcript: str) -> list:
+    if len(transcript) > 90_000:
+        transcript = transcript[:90_000] + "\n\n[transcript truncated]"
+    return [
+        {
+            "role": "system",
+            "content": "You are a helpful assistant that summarizes video transcripts clearly and concisely.",
+        },
+        {
+            "role": "user",
+            "content": (
+                "Please provide a clear, structured summary of the following video transcript. "
+                "Include: a brief overview, the main topics covered, and key takeaways.\n\n"
+                f"TRANSCRIPT:\n{transcript}"
+            ),
+        },
+    ]
+
+
+def iter_summarize_stream(transcript: str, base_url: str, model: str, api_key: str = ""):
+    """Stream summary text chunks from LM Studio (OpenAI-compatible)."""
+    client = OpenAI(base_url=base_url, api_key=api_key or "lm-studio")
+    stream = client.chat.completions.create(
+        model=model,
+        messages=_summarize_messages(transcript),
+        temperature=0.3,
+        stream=True,
+    )
+    for chunk in stream:
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+        if delta is None:
+            continue
+        raw = getattr(delta, "content", None)
+        if raw is None:
+            raw = getattr(delta, "refusal", None)
+        piece = _raw_content_to_text(raw)
+        if piece:
+            yield piece
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -206,14 +207,39 @@ def summarize():
             return jsonify({"error": "Subtitle file was empty after parsing."}), 400
 
         saved_path = save_plaintext_transcript(transcript, vtt_path, lang)
-        summary = summarize_with_lmstudio(transcript, base_url, model, api_key)
         rel_saved = os.path.relpath(saved_path, _APP_DIR)
-        return jsonify(
-            {
-                "summary": summary,
-                "transcript_length": len(transcript),
-                "saved_transcript": rel_saved.replace(os.sep, "/"),
-            }
+        meta = {
+            "transcript_length": len(transcript),
+            "saved_transcript": rel_saved.replace(os.sep, "/"),
+        }
+
+        def event_stream():
+            yield f"event: ready\ndata: {json.dumps(meta)}\n\n"
+            total = []
+            try:
+                for piece in iter_summarize_stream(transcript, base_url, model, api_key):
+                    total.append(piece)
+                    yield f"event: token\ndata: {json.dumps({'t': piece})}\n\n"
+                full = "".join(total).strip()
+                if not full:
+                    err = (
+                        "Model returned an empty summary (no streamed text). "
+                        "Try another model or check LM Studio server logs."
+                    )
+                    yield f"event: error\ndata: {json.dumps({'error': err})}\n\n"
+                    return
+                yield "event: done\ndata: {}\n\n"
+            except Exception as e:
+                yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+
+        return Response(
+            stream_with_context(event_stream()),
+            mimetype="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
         )
 
     except FileNotFoundError as e:

@@ -96,6 +96,41 @@ function setSummaryFromMarkdown(markdown) {
   $('summary-output').innerHTML = markdownToHtml(markdown);
 }
 
+/** Parse one SSE block (lines ending with blank line already stripped). */
+function parseSseBlock(raw) {
+  let eventName = 'message';
+  const dataLines = [];
+  for (const line of raw.split('\n')) {
+    if (line.startsWith('event:')) eventName = line.slice(6).trim();
+    else if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^\s/, ''));
+  }
+  if (!dataLines.length) return null;
+  const dataStr = dataLines.join('\n').trim();
+  try {
+    return { event: eventName, data: JSON.parse(dataStr) };
+  } catch {
+    return { event: eventName, data: { raw: dataStr } };
+  }
+}
+
+async function readSseStream(response, onEvent) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  for (;;) {
+    const { done, value } = await reader.read();
+    buf += decoder.decode(value || new Uint8Array(), { stream: !done }).replace(/\r\n/g, '\n');
+    let sep;
+    while ((sep = buf.indexOf('\n\n')) !== -1) {
+      const block = buf.slice(0, sep);
+      buf = buf.slice(sep + 2);
+      const evt = parseSseBlock(block);
+      if (evt) onEvent(evt);
+    }
+    if (done) break;
+  }
+}
+
 function timestamp() {
   return new Date().toLocaleTimeString('en-US', { hour12: false });
 }
@@ -178,50 +213,106 @@ async function runSummarize() {
       body: JSON.stringify({ url, lang, base_url: baseUrl, model, api_key: apiKey || null }),
     });
 
-    let data;
-    try {
-      data = await res.json();
-    } catch {
-      log('Error: response was not valid JSON', 'err');
-      showError('Server returned a non-JSON response. Check the Flask terminal for errors.');
+    const ct = (res.headers.get('content-type') || '').toLowerCase();
+
+    if (ct.includes('application/json')) {
+      let data;
+      try {
+        data = await res.json();
+      } catch {
+        log('Error: response was not valid JSON', 'err');
+        showError('Server returned a non-JSON response. Check the Flask terminal for errors.');
+        setRunning(false);
+        return;
+      }
+      if (!res.ok || data.error) {
+        log(`Error: ${data.error}`, 'err');
+        showError(data.error || 'Request failed');
+        setRunning(false);
+        return;
+      }
       setRunning(false);
       return;
     }
 
-    if (!res.ok || data.error) {
-      log(`Error: ${data.error}`, 'err');
-      showError(data.error);
+    if (!res.ok) {
+      let msg = `HTTP ${res.status}`;
+      try {
+        const errBody = await res.json();
+        if (errBody.error) msg = errBody.error;
+      } catch { /* ignore */ }
+      log(`Error: ${msg}`, 'err');
+      showError(msg);
       setRunning(false);
       return;
     }
 
-    log('Subtitles downloaded and parsed.', 'ok');
-    const tlen = data.transcript_length;
-    if (typeof tlen === 'number') {
-      log(`Transcript length: ${tlen.toLocaleString()} chars`);
+    if (!ct.includes('text/event-stream')) {
+      log('Error: expected streamed summary (text/event-stream)', 'err');
+      showError('Unexpected response from server.');
+      setRunning(false);
+      return;
     }
-    log('Sending transcript to model...', 'info');
-    log('Summary received.', 'ok');
 
-    const summary =
-      data.summary != null && typeof data.summary === 'string'
-        ? data.summary
-        : data.summary != null
-          ? String(data.summary)
-          : '';
-    if (!summary.trim()) {
+    let summaryMarkdown = '';
+    let rafPending = null;
+    const flushSummary = () => {
+      rafPending = null;
+      setSummaryFromMarkdown(summaryMarkdown);
+    };
+    const scheduleFlush = () => {
+      if (rafPending === null) rafPending = requestAnimationFrame(flushSummary);
+    };
+
+    let streamError = null;
+    await readSseStream(res, evt => {
+      if (evt.event === 'ready') {
+        log('Subtitles downloaded and parsed.', 'ok');
+        const tlen = evt.data.transcript_length;
+        if (typeof tlen === 'number') {
+          log(`Transcript length: ${tlen.toLocaleString()} chars`);
+        }
+        log('Streaming summary from model...', 'info');
+        $('result-section').style.display = 'block';
+        $('result-section').scrollIntoView({ behavior: 'smooth', block: 'start' });
+        return;
+      }
+      if (evt.event === 'token' && evt.data && typeof evt.data.t === 'string') {
+        summaryMarkdown += evt.data.t;
+        scheduleFlush();
+        return;
+      }
+      if (evt.event === 'done') {
+        return;
+      }
+      if (evt.event === 'error' && evt.data && evt.data.error) {
+        streamError = evt.data.error;
+      }
+    });
+
+    if (rafPending !== null) {
+      cancelAnimationFrame(rafPending);
+      rafPending = null;
+    }
+    setSummaryFromMarkdown(summaryMarkdown);
+
+    if (streamError) {
+      log(`Error: ${streamError}`, 'err');
+      showError(streamError);
+      setRunning(false);
+      return;
+    }
+
+    if (!summaryMarkdown.trim()) {
       const hint =
-        'The server responded OK but the summary was empty. Often the local model returned null content — pick another model or check LM Studio.';
+        'The stream ended without summary text. Pick another model or check LM Studio.';
       log(hint, 'err');
       showError(hint);
       setRunning(false);
       return;
     }
 
-    setSummaryFromMarkdown(summary);
-    $('result-section').style.display = 'block';
-    $('result-section').scrollIntoView({ behavior: 'smooth', block: 'start' });
-
+    log('Summary complete.', 'ok');
   } catch (err) {
     log(`Error: ${err.message}`, 'err');
     showError(err.message || String(err));
