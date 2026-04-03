@@ -1,10 +1,11 @@
+import json
 import os
 import re
 import sys
 import glob
 import subprocess
 import tempfile
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, Response, stream_with_context
 from flask_cors import CORS
 from openai import OpenAI
 
@@ -16,6 +17,26 @@ LMSTUDIO_BASE_URL = os.environ.get("LMSTUDIO_BASE_URL", "http://localhost:1234/v
 
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOADED_SUBTITLES_DIR = os.path.join(_APP_DIR, "downloaded-subtitles")
+
+def _safe_downloaded_subtitle_path(rel_path: str) -> str:
+    """
+    Convert a client-provided relative path like 'downloaded-subtitles/x.en.txt'
+    into an absolute path under DOWNLOADED_SUBTITLES_DIR. Raises ValueError if invalid.
+    """
+    if not isinstance(rel_path, str) or not rel_path.strip():
+        raise ValueError("Missing subtitle path.")
+    p = rel_path.replace("\\", "/").lstrip("/")
+    prefix = "downloaded-subtitles/"
+    if not p.startswith(prefix):
+        raise ValueError("Invalid subtitle path.")
+    leaf = p[len(prefix):]
+    if not leaf or "/" in leaf:
+        raise ValueError("Invalid subtitle filename.")
+    abs_path = os.path.abspath(os.path.join(DOWNLOADED_SUBTITLES_DIR, leaf))
+    base = os.path.abspath(DOWNLOADED_SUBTITLES_DIR)
+    if os.path.commonpath([abs_path, base]) != base:
+        raise ValueError("Invalid subtitle path.")
+    return abs_path
 
 
 def _safe_filename_stem(name: str) -> str:
@@ -93,41 +114,8 @@ def vtt_to_text(vtt_path: str) -> str:
     return " ".join(lines)
 
 
-def summarize_with_lmstudio(transcript: str, base_url: str, model: str, api_key: str = "") -> str:
-    """Send transcript to LM Studio and return the summary."""
-    # Use provided key as Bearer token; fall back to dummy value if not set
-    client = OpenAI(base_url=base_url, api_key=api_key or "lm-studio")
-
-    if len(transcript) > 90_000:
-        transcript = transcript[:90_000] + "\n\n[transcript truncated]"
-
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {
-                "role": "system",
-                "content": "You are a helpful assistant that summarizes video transcripts clearly and concisely.",
-            },
-            {
-                "role": "user",
-                "content": (
-                    "Please provide a clear, structured summary of the following video transcript. "
-                    "Include: a brief overview, the main topics covered, and key takeaways.\n\n"
-                    f"TRANSCRIPT:\n{transcript}"
-                ),
-            },
-        ],
-        temperature=0.3,
-    )
-
-    if not response.choices:
-        raise RuntimeError("Model returned no choices (empty completion).")
-
-    msg = response.choices[0].message
-    raw = getattr(msg, "content", None) if msg else None
-    if raw is None and msg is not None:
-        raw = getattr(msg, "refusal", None)
-
+def _raw_content_to_text(raw) -> str:
+    """Normalize message.content or delta.content (str, list of parts, or None) to plain text."""
     if isinstance(raw, list):
         parts = []
         for p in raw:
@@ -137,19 +125,104 @@ def summarize_with_lmstudio(transcript: str, base_url: str, model: str, api_key:
                 parts.append(getattr(p, "text", "") or "")
             elif isinstance(p, str):
                 parts.append(p)
-        text = "".join(parts)
-    elif raw is None:
-        text = ""
-    else:
-        text = str(raw)
+        return "".join(parts)
+    if raw is None:
+        return ""
+    return str(raw)
 
-    text = text.strip()
-    if not text:
-        raise RuntimeError(
-            "Model returned an empty summary (no text in message.content). "
-            "Try another model or check LM Studio server logs."
-        )
-    return text
+
+MAX_TRANSCRIPT_CHARS = 90_000
+
+# Same system string for /api/summarize and /api/chat so LM Studio can prefix-cache
+# the shared system + transcript user block across both requests.
+SHARED_SYSTEM = (
+    "You are a helpful assistant that summarizes video transcripts clearly and concisely."
+)
+
+SUMMARIZE_INSTRUCTION_USER = (
+    "Please provide a clear, structured summary of the video transcript in your previous "
+    "message. Include: a brief overview, the main topics covered, and key takeaways."
+)
+
+CHAT_MODE_USER = (
+    "Answer my questions using only the transcript from the first user message in this "
+    "conversation. Quote or paraphrase accurately; if something is not in the transcript, say so."
+)
+
+
+def _transcript_user_block(transcript: str) -> str:
+    """Identical transcript payload for summarize and chat (must stay byte-stable for caching)."""
+    t = transcript or ""
+    if len(t) > MAX_TRANSCRIPT_CHARS:
+        t = t[:MAX_TRANSCRIPT_CHARS] + "\n\n[transcript truncated]"
+    return f"TRANSCRIPT:\n{t}"
+
+
+def _summarize_messages(transcript: str) -> list:
+    return [
+        {"role": "system", "content": SHARED_SYSTEM},
+        {"role": "user", "content": _transcript_user_block(transcript)},
+        {"role": "user", "content": SUMMARIZE_INSTRUCTION_USER},
+    ]
+
+
+def iter_summarize_stream(transcript: str, base_url: str, model: str, api_key: str = ""):
+    """Stream summary text chunks from LM Studio (OpenAI-compatible)."""
+    client = OpenAI(base_url=base_url, api_key=api_key or "lm-studio")
+    stream = client.chat.completions.create(
+        model=model,
+        messages=_summarize_messages(transcript),
+        temperature=0.3,
+        stream=True,
+    )
+    for chunk in stream:
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+        if delta is None:
+            continue
+        raw = getattr(delta, "content", None)
+        if raw is None:
+            raw = getattr(delta, "refusal", None)
+        piece = _raw_content_to_text(raw)
+        if piece:
+            yield piece
+
+
+def _normalize_chat_tail(messages: list, limit: int = 4) -> list:
+    cleaned = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        content = m.get("content")
+        if role not in ("user", "assistant") or not isinstance(content, str):
+            continue
+        cleaned.append({"role": role, "content": content})
+    return cleaned[-limit:] if limit else cleaned
+
+
+def iter_chat_stream(messages: list, base_url: str, model: str, api_key: str = ""):
+    """Stream chat completion text chunks from LM Studio (OpenAI-compatible)."""
+    client = OpenAI(base_url=base_url, api_key=api_key or "lm-studio")
+    stream = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=0.4,
+        stream=True,
+    )
+    for chunk in stream:
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+        if delta is None:
+            continue
+        raw = getattr(delta, "content", None)
+        if raw is None:
+            raw = getattr(delta, "refusal", None)
+        piece = _raw_content_to_text(raw)
+        if piece:
+            yield piece
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -157,6 +230,16 @@ def summarize_with_lmstudio(transcript: str, base_url: str, model: str, api_key:
 @app.route("/")
 def index():
     return send_from_directory(".", "index.html")
+
+
+@app.route("/styles.css")
+def styles():
+    return send_from_directory(_APP_DIR, "styles.css", mimetype="text/css")
+
+
+@app.route("/app.js")
+def app_js():
+    return send_from_directory(_APP_DIR, "app.js", mimetype="application/javascript")
 
 
 @app.route("/api/models", methods=["GET"])
@@ -196,20 +279,120 @@ def summarize():
             return jsonify({"error": "Subtitle file was empty after parsing."}), 400
 
         saved_path = save_plaintext_transcript(transcript, vtt_path, lang)
-        summary = summarize_with_lmstudio(transcript, base_url, model, api_key)
         rel_saved = os.path.relpath(saved_path, _APP_DIR)
-        return jsonify(
-            {
-                "summary": summary,
-                "transcript_length": len(transcript),
-                "saved_transcript": rel_saved.replace(os.sep, "/"),
-            }
+        meta = {
+            "transcript_length": len(transcript),
+            "saved_transcript": rel_saved.replace(os.sep, "/"),
+            "transcript": transcript,
+        }
+
+        def event_stream():
+            yield f"event: ready\ndata: {json.dumps(meta)}\n\n"
+            total = []
+            try:
+                for piece in iter_summarize_stream(transcript, base_url, model, api_key):
+                    total.append(piece)
+                    yield f"event: token\ndata: {json.dumps({'t': piece})}\n\n"
+                full = "".join(total).strip()
+                if not full:
+                    err = (
+                        "Model returned an empty summary (no streamed text). "
+                        "Try another model or check LM Studio server logs."
+                    )
+                    yield f"event: error\ndata: {json.dumps({'error': err})}\n\n"
+                    return
+                yield "event: done\ndata: {}\n\n"
+            except Exception as e:
+                yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+
+        return Response(
+            stream_with_context(event_stream()),
+            mimetype="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
         )
 
     except FileNotFoundError as e:
         return jsonify({"error": str(e)}), 404
     except RuntimeError as e:
         return jsonify({"error": str(e)}), 500
+    except Exception as e:
+        return jsonify({"error": f"Unexpected error: {e}"}), 500
+
+
+@app.route("/api/chat", methods=["POST"])
+def chat():
+    data = request.get_json() or {}
+    transcript = data.get("transcript")
+    transcript = transcript.strip() if isinstance(transcript, str) else ""
+    raw_messages = data.get("messages")
+    if not isinstance(raw_messages, list):
+        raw_messages = []
+    base_url = (data.get("base_url") or LMSTUDIO_BASE_URL).rstrip("/")
+    model = (data.get("model") or "").strip()
+    api_key = (data.get("api_key") or "").strip()
+
+    if not transcript:
+        return jsonify({"error": "Transcript is required for chat."}), 400
+    if not model:
+        return jsonify({"error": "No model selected."}), 400
+
+    tail = _normalize_chat_tail(raw_messages, 4)
+    if not tail:
+        return jsonify({"error": "No chat messages to process."}), 400
+    if tail[-1]["role"] != "user":
+        return jsonify({"error": "The latest message must be from the user."}), 400
+
+    api_messages = [
+        {"role": "system", "content": SHARED_SYSTEM},
+        {"role": "user", "content": _transcript_user_block(transcript)},
+        {"role": "user", "content": CHAT_MODE_USER},
+        *tail,
+    ]
+
+    def event_stream():
+        total = []
+        try:
+            for piece in iter_chat_stream(api_messages, base_url, model, api_key):
+                total.append(piece)
+                yield f"event: token\ndata: {json.dumps({'t': piece})}\n\n"
+            full = "".join(total).strip()
+            if not full:
+                err = (
+                    "Model returned an empty reply (no streamed text). "
+                    "Try another model or check LM Studio server logs."
+                )
+                yield f"event: error\ndata: {json.dumps({'error': err})}\n\n"
+                return
+            yield "event: done\ndata: {}\n\n"
+        except Exception as e:
+            yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+
+    return Response(
+        stream_with_context(event_stream()),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+@app.route("/api/subtitle", methods=["GET"])
+def get_subtitle():
+    rel = (request.args.get("path") or "").strip()
+    try:
+        abs_path = _safe_downloaded_subtitle_path(rel)
+        if not os.path.exists(abs_path):
+            return jsonify({"error": "Subtitle file not found."}), 404
+        with open(abs_path, "r", encoding="utf-8") as f:
+            txt = f.read()
+        return Response(txt, mimetype="text/plain; charset=utf-8")
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     except Exception as e:
         return jsonify({"error": f"Unexpected error: {e}"}), 500
 
